@@ -1,0 +1,102 @@
+import warnings
+import numpy as np
+import pandas as pd
+from typing import Tuple, Optional
+from dataclasses import dataclass
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+# Suppress minor library deprecation warnings for a clean console output
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
+
+@dataclass
+class KalmanConfig:
+    delta: float = 1e-5  # Process variance / transition covariance
+    vt: float = 1e-3     # Observation variance / measurement noise
+    initial_intercept: float = 0.0
+    initial_slope: float = 1.0
+
+class DynamicKalmanPairTrader:
+    """
+    Online Kalman Filter for State-Space Cointegration & Pairs Trading.
+    Continuously estimates time-varying hedge ratios (beta) and intercept (alpha)
+    between two asset price series without lookahead bias.
+    """
+    def __init__(self, config: Optional[KalmanConfig] = None):
+        self.config = config or KalmanConfig()
+        self.state = np.array([self.config.initial_intercept, self.config.initial_slope])
+        self.P = np.zeros((2, 2))
+
+    def initialize_state(self, initial_cov_scale: float = 1e3) -> None:
+        self.P = np.eye(2) * initial_cov_scale
+
+    def update(self, y: float, x: float) -> Tuple[float, float, float]:
+        R = self.config.delta * np.eye(2)
+        P_pred = self.P + R
+        F = np.array([1.0, x])
+        y_pred = np.dot(F, self.state)
+        residual = y - y_pred
+        S = np.dot(F, np.dot(P_pred, F)) + self.config.vt
+        K = np.dot(P_pred, F) / S
+        self.state = self.state + K * residual
+        self.P = P_pred - np.outer(K, np.dot(F, P_pred))
+        return residual, self.state[0], self.state[1]
+
+    def process_series(self, y_series: pd.Series, x_series: pd.Series, window: int = 30) -> pd.DataFrame:
+        self.initialize_state()
+        alphas, betas, residuals = [], [], []
+        
+        for y, x in zip(y_series, x_series):
+            res, alpha, beta = self.update(y, x)
+            alphas.append(alpha)
+            betas.append(beta)
+            residuals.append(res)
+
+        df_out = pd.DataFrame({
+            'Asset_Y': y_series,
+            'Asset_X': x_series,
+            'Alpha': alphas,
+            'Beta': betas,
+            'Residual': residuals
+        }, index=y_series.index)
+
+        df_out['Spread_Mean'] = df_out['Residual'].rolling(window=window).mean()
+        df_out['Spread_Std'] = df_out['Residual'].rolling(window=window).std()
+        df_out['ZScore'] = (df_out['Residual'] - df_out['Spread_Mean']) / df_out['Spread_Std']
+        
+        df_out['Signal'] = 0
+        df_out.loc[df_out['ZScore'] < -2.0, 'Signal'] = 1
+        df_out.loc[df_out['ZScore'] > 2.0, 'Signal'] = -1
+        df_out.loc[df_out['ZScore'].abs() < 0.5, 'Signal'] = 0
+        df_out['Signal'] = df_out['Signal'].ffill().fillna(0)
+
+        return df_out
+
+# --- Execution Block ---
+if __name__ == "__main__":
+    print("Downloading real market data from Yahoo Finance (KO vs PEP)...")
+    tickers = ["KO", "PEP"]
+    data = yf.download(tickers, start="2023-01-01", end="2026-01-01", progress=False)['Close']
+    
+    # Extract individual series
+    y_series = data['KO']
+    x_series = data['PEP']
+    
+    # Run the Kalman Filter pair trader
+    trader = DynamicKalmanPairTrader()
+    results = trader.process_series(y_series, x_series)
+    
+    print("\n--- Latest Signals & Z-Scores ---")
+    print(results[['Asset_Y', 'Asset_X', 'Beta', 'ZScore', 'Signal']].tail(10))
+    
+    # Plot the Z-Score chart
+    plt.figure(figsize=(10, 5))
+    plt.plot(results.index, results['ZScore'], label='Spread Z-Score', color='purple')
+    plt.axhline(2.0, color='red', linestyle='--', label='Short Threshold (+2)')
+    plt.axhline(-2.0, color='green', linestyle='--', label='Long Threshold (-2)')
+    plt.axhline(0, color='black', alpha=0.3)
+    plt.title('Dynamic Kalman Filter Z-Score: Coca-Cola (KO) vs Pepsi (PEP)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
